@@ -112,6 +112,7 @@ function LivePage() {
 }
 
 function DetectPage() {
+  const qc = useQueryClient();
   const create = useCreateDetection();
   const [frames, setFrames] = useState(['MH12AB1234', 'MH12AB1234', 'MH12A81234']);
   const [gate, setGate] = useState('North Gate');
