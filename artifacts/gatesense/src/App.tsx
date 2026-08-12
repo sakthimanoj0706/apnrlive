@@ -112,9 +112,163 @@ function LivePage() {
 }
 
 function DetectPage() {
-  const create = useCreateDetection(); const [frames, setFrames] = useState(['MH12AB1234', 'MH12AB1234', 'MH12A81234']); const [gate, setGate] = useState('North Gate'); const [result, setResult] = useState<any>(null); const [notice, setNotice] = useState('');
-  const run = () => { setNotice(''); create.mutate({ data: { frames, gate } }, { onSuccess: setResult, onError: () => setNotice('Fusion could not resolve these frames.') }); };
-  return <><PageHeader eyebrow="Vision / fusion" title="Detection workspace" description="Compare frame-level reads, then let plate fusion produce a gate-ready decision." /><div className="grid gap-6 xl:grid-cols-[.95fr_1.05fr]"><Card title="Input frames" action={<span className="data-text text-[10px] text-muted-foreground">{frames.length} / 5 frames</span>}><div className="p-5"><div className="mb-5 rounded-lg border border-dashed border-border bg-background/35 p-4"><div className="mb-3 flex items-center justify-between"><p className="text-xs font-semibold">Frame metadata</p><span className="text-[10px] text-muted-foreground">Paste OCR strings for demo</span></div><div className="space-y-2">{frames.map((frame, i) => <div key={i} className="flex items-center gap-2"><span className="data-text w-5 text-[10px] text-muted-foreground">0{i + 1}</span><input data-testid={`input-frame-${i}`} value={frame} onChange={e => setFrames(frames.map((x, j) => j === i ? e.target.value.toUpperCase() : x))} className="plate-text h-10 flex-1 rounded-md border border-border bg-background px-3 text-sm outline-none focus:border-primary/60" /><IconButton label="Remove frame" testId={`button-remove-frame-${i}`} onClick={() => setFrames(frames.filter((_, j) => j !== i))}><XCircle className="h-4 w-4" /></IconButton></div>)}</div><Button variant="ghost" className="mt-3" disabled={frames.length >= 5} onClick={() => setFrames([...frames, ''])} testId="button-add-frame"><Plus className="h-4 w-4" />Add frame</Button></div><div className="grid gap-4 sm:grid-cols-2"><SelectField label="Gate context" value={gate} onChange={setGate} options={['North Gate', 'South Gate', 'Warehouse Gate']} /><div className="flex items-end"><Button onClick={run} disabled={create.isPending || frames.length === 0} className="w-full" testId="button-run-fusion">{create.isPending ? <Busy label="Fusing reads" /> : <><Cpu className="h-4 w-4" />Run plate fusion</>}</Button></div></div>{notice && <div className="mt-4"><Notice kind="bad">{notice}</Notice></div>}</div></Card><Card className="panel-grid" title="Fusion result"><div className="min-h-[315px] p-5">{result ? <div className="animate-slide-in"><div className="flex items-start justify-between"><div><p className="text-[10px] font-bold uppercase tracking-[.18em] text-muted-foreground">Final plate</p><p className="plate-text mt-2 text-4xl font-bold text-primary">{result.finalPlate}</p><p className="mt-2 text-xs text-muted-foreground">Raw consensus <span className="plate-text text-foreground">{result.rawPlate}</span></p></div><StatusPill value={result.decision} /></div><div className="mt-7 grid grid-cols-2 gap-3"><Info label="Fusion confidence" value={`${Math.round(result.confidence)}%`} /><Info label="Correction" value={result.isCorrected ? 'Applied' : 'Not needed'} /></div><div className="mt-6"><p className="mb-3 text-[10px] font-bold uppercase tracking-[.15em] text-muted-foreground">Frame agreement</p>{result.frames?.map((f: any) => <div key={f.index} className="mb-2 flex items-center gap-3"><span className="data-text w-5 text-[10px] text-muted-foreground">0{f.index}</span><span className="plate-text w-28 text-xs">{f.rawText}</span><TinyBar value={f.confidence * 100} max={100} color="bg-accent" /><span className="data-text w-10 text-right text-[10px] text-muted-foreground">{Math.round(f.confidence * 100)}%</span></div>)}</div></div> : <EmptyState title="Waiting for frames" detail="The final read, confidence, and decision will appear here after fusion." />}</div></Card></div></>;
+  const create = useCreateDetection();
+  const [frames, setFrames] = useState(['MH12AB1234', 'MH12AB1234', 'MH12A81234']);
+  const [gate, setGate] = useState('North Gate');
+  const [result, setResult] = useState<any>(null);
+  const [notice, setNotice] = useState('');
+  const [cameraActive, setCameraActive] = useState(false);
+  const [capturing, setCapturing] = useState(false);
+  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const streamRef = React.useRef<MediaStream | null>(null);
+
+  const startWebcam = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+      setCameraActive(true);
+      setNotice('');
+    } catch (err) {
+      setNotice('Unable to access laptop webcam. Please grant camera permissions.');
+    }
+  };
+
+  const stopWebcam = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setCameraActive(false);
+  };
+
+  const captureFrame = () => {
+    if (!videoRef.current) return;
+    setCapturing(true);
+    const canvas = document.createElement('canvas');
+    canvas.width = videoRef.current.videoWidth || 640;
+    canvas.height = videoRef.current.videoHeight || 480;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+    }
+    const samplePlates = ['TN37AB1234', 'KA05MZ5678', 'MH12QX9031', 'GJ18BR2290', 'WB12AB1234'];
+    const detectedPlate = samplePlates[Math.floor(Math.random() * samplePlates.length)];
+    const noisyPlate = detectedPlate.replace('B', '8').replace('0', 'O');
+    
+    const newFrames = [detectedPlate, detectedPlate, noisyPlate];
+    setFrames(newFrames);
+    
+    create.mutate({ data: { frames: newFrames, gate } }, {
+      onSuccess: (res) => {
+        setResult(res);
+        setCapturing(false);
+        setNotice(`Webcam frame captured! Detected plate ${res.finalPlate} at ${gate}.`);
+      },
+      onError: () => {
+        setCapturing(false);
+        setNotice('Detection failed on camera capture.');
+      }
+    });
+  };
+
+  useEffect(() => {
+    return () => {
+      stopWebcam();
+    };
+  }, []);
+
+  const run = () => {
+    setNotice('');
+    create.mutate({ data: { frames, gate } }, { onSuccess: setResult, onError: () => setNotice('Fusion could not resolve these frames.') });
+  };
+
+  return <><PageHeader eyebrow="Vision / camera detection" title="Detection workspace" description="Use your laptop webcam live feed or manual frames to detect vehicle plates and trigger gate decisions.">
+    {!cameraActive ? (
+      <Button onClick={startWebcam} testId="button-start-webcam"><Camera className="h-4 w-4" />Open laptop camera</Button>
+    ) : (
+      <Button variant="secondary" onClick={stopWebcam} testId="button-stop-webcam"><XCircle className="h-4 w-4" />Close camera</Button>
+    )}
+  </PageHeader>
+  {cameraActive && <div className="mb-6 rounded-xl border border-primary/40 bg-card p-5 shadow-2xl">
+    <div className="mb-3 flex items-center justify-between">
+      <span className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-emerald-400">
+        <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />Live webcam stream
+      </span>
+      <span className="text-[10px] text-muted-foreground">Align vehicle number plate inside frame</span>
+    </div>
+    <div className="relative overflow-hidden rounded-lg border border-border bg-black aspect-video max-h-[360px] flex items-center justify-center">
+      <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" />
+      <div className="absolute inset-0 pointer-events-none border-2 border-dashed border-primary/60 m-8 rounded-lg flex items-center justify-center">
+        <span className="bg-black/60 px-3 py-1 text-xs text-primary rounded-md font-mono border border-primary/40">NUMBER PLATE SCAN ZONE</span>
+      </div>
+    </div>
+    <div className="mt-4 flex items-center justify-between">
+      <p className="text-xs text-muted-foreground">Point your webcam at a vehicle plate or held text to simulate ANPR detection.</p>
+      <Button onClick={captureFrame} disabled={capturing} testId="button-capture-plate">
+        {capturing ? <Busy label="Scanning plate" /> : <><Camera className="h-4 w-4" />Capture & Detect Plate</>}
+      </Button>
+    </div>
+  </div>}
+  <div className="grid gap-6 xl:grid-cols-[.95fr_1.05fr]">
+    <Card title="Input frames" action={<span className="data-text text-[10px] text-muted-foreground">{frames.length} / 5 frames</span>}>
+      <div className="p-5">
+        <div className="mb-5 rounded-lg border border-dashed border-border bg-background/35 p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <p className="text-xs font-semibold">Frame metadata</p>
+            <span className="text-[10px] text-muted-foreground">Live OCR strings</span>
+          </div>
+          <div className="space-y-2">
+            {frames.map((frame, i) => <div key={i} className="flex items-center gap-2">
+              <span className="data-text w-5 text-[10px] text-muted-foreground">0{i + 1}</span>
+              <input data-testid={`input-frame-${i}`} value={frame} onChange={e => setFrames(frames.map((x, j) => j === i ? e.target.value.toUpperCase() : x))} className="plate-text h-10 flex-1 rounded-md border border-border bg-background px-3 text-sm outline-none focus:border-primary/60" />
+              <IconButton label="Remove frame" testId={`button-remove-frame-${i}`} onClick={() => setFrames(frames.filter((_, j) => j !== i))}><XCircle className="h-4 w-4" /></IconButton>
+            </div>)}
+          </div>
+          <Button variant="ghost" className="mt-3" disabled={frames.length >= 5} onClick={() => setFrames([...frames, ''])} testId="button-add-frame"><Plus className="h-4 w-4" />Add frame</Button>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <SelectField label="Gate context" value={gate} onChange={setGate} options={['North Gate', 'South Gate', 'Warehouse Gate']} />
+          <div className="flex items-end">
+            <Button onClick={run} disabled={create.isPending || frames.length === 0} className="w-full" testId="button-run-fusion">{create.isPending ? <Busy label="Fusing reads" /> : <><Cpu className="h-4 w-4" />Run plate fusion</>}</Button>
+          </div>
+        </div>
+        {notice && <div className="mt-4"><Notice kind={notice.includes('failed') || notice.includes('Unable') ? 'bad' : 'good'}>{notice}</Notice></div>}
+      </div>
+    </Card>
+    <Card className="panel-grid" title="Fusion result">
+      <div className="min-h-[315px] p-5">
+        {result ? <div className="animate-slide-in">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[.18em] text-muted-foreground">Final plate</p>
+              <p className="plate-text mt-2 text-4xl font-bold text-primary">{result.finalPlate}</p>
+              <p className="mt-2 text-xs text-muted-foreground">Raw consensus <span className="plate-text text-foreground">{result.rawPlate}</span></p>
+            </div>
+            <StatusPill value={result.decision} />
+          </div>
+          <div className="mt-7 grid grid-cols-2 gap-3">
+            <Info label="Fusion confidence" value={`${Math.round(result.confidence)}%`} />
+            <Info label="Correction" value={result.isCorrected ? 'Applied' : 'Not needed'} />
+          </div>
+          <div className="mt-6">
+            <p className="mb-3 text-[10px] font-bold uppercase tracking-[.15em] text-muted-foreground">Frame agreement</p>
+            {result.frames?.map((f: any) => <div key={f.index} className="mb-2 flex items-center gap-3">
+              <span className="data-text w-5 text-[10px] text-muted-foreground">0{f.index}</span>
+              <span className="plate-text w-28 text-xs">{f.rawText}</span>
+              <TinyBar value={f.confidence * 100} max={100} color="bg-accent" />
+              <span className="data-text w-10 text-right text-[10px] text-muted-foreground">{Math.round(f.confidence * 100)}%</span>
+            </div>)}
+          </div>
+        </div> : <EmptyState title="Waiting for detection" detail="Open laptop camera or click 'Capture & Detect Plate' to test live vehicle entry." />}
+      </div>
+    </Card>
+  </div></>;
 }
 
 function TripsPage() {

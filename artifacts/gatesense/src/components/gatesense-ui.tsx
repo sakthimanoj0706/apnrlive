@@ -54,7 +54,7 @@ export function EmptyState({ title, detail, action }: { title: string; detail: s
 }
 
 export function DataTable({ children, headers }: { children: ReactNode; headers: string[] }) {
-  return <div className="overflow-x-auto scrollbar-thin"><table className="w-full min-w-[720px] text-left"><thead><tr className="border-b border-border/70">{headers.map((h) => <th key={h} className="px-5 py-3 text-[10px] font-bold uppercase tracking-[.15em] text-muted-foreground">{h}</th>)}</tr></thead><tbody>{children}</tbody></table></div>;
+  return <div className="overflow-x-auto scrollbar-thin"><table className="w-full min-w-[720px] text-left"><thead><tr className="border-b border-border/70">{headers.map((h) => <th key={h} className="px-5 py-3 text-[10px] font-bold uppercase tracking-[.15em] text-muted-foreground">{h}</th>)}</tr></thead>{children}</table></div>;
 }
 
 export function SearchBox({ value, onChange, placeholder = 'Search records' }: { value: string; onChange: (value: string) => void; placeholder?: string }) {
