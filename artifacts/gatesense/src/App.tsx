@@ -183,6 +183,10 @@ function DetectPage() {
           setResult(res);
           setProcessingVideo(false);
           setNotice(`Extracted plate number ${res.finalPlate} from video ${videoFileName}!`);
+          qc.invalidateQueries({ queryKey: getGetAlertsQueryKey() });
+          qc.invalidateQueries({ queryKey: getGetEventsQueryKey() });
+          qc.invalidateQueries({ queryKey: getGetDashboardSummaryQueryKey() });
+          qc.invalidateQueries({ queryKey: getGetActiveTripsQueryKey() });
           document.getElementById('fusion-result-card')?.scrollIntoView({ behavior: 'smooth' });
         },
         onError: () => {
