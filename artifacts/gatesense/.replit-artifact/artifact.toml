@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "GateSense — Smart Gate & Trip Intelligence"
+description = "A real-time industrial vehicle entry and exit management platform with simulated edge-AI plate recognition, gate decisions, trip monitoring, alerts, and operational reports."
+version = "1.0.0"
+id = "artifacts/gatesense"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 24610
+
+[services.development]
+run = "pnpm --filter @workspace/gatesense run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/gatesense", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/gatesense/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24610"
+BASE_PATH = "/"
