@@ -164,72 +164,87 @@ function DetectPage() {
   };
 
   // ── OCR helper ────────────────────────────────────────────────────────────
-  //  1. Crop to candidate plate region (passed as sx,sy,sw,sh in source coords)
-  //  2. Scale up 3× so characters are bigger
-  //  3. Binary-threshold: every pixel above mid-grey → white, else → black
-  //  4. Run Tesseract with alphanumeric-only whitelist
+  //  1. Crop + scale up 3× (larger chars = better OCR)
+  //  2. Contrast-stretch to [0,255] (adaptive, works in all lighting)
+  //  3. Tesseract with alphanumeric whitelist + PSM 11 (sparse text)
+  //  4. Try inverted image too (some plates are light-on-dark)
   const ocrRegion = async (
     source: HTMLCanvasElement | HTMLVideoElement,
     sx: number, sy: number, sw: number, sh: number
-  ): Promise<string> => {
+  ): Promise<string[]> => {
     const SCALE = 3;
     const out = document.createElement('canvas');
     out.width  = sw * SCALE;
     out.height = sh * SCALE;
     const ctx = out.getContext('2d')!;
-
-    // Draw scaled crop
     ctx.drawImage(source, sx, sy, sw, sh, 0, 0, out.width, out.height);
 
-    // Binary threshold (grayscale → black or white)
+    // Adaptive contrast-stretch: find actual min/max luminance in this region
     const img = ctx.getImageData(0, 0, out.width, out.height);
-    const d   = img.data;
+    const d = img.data;
+    const grays: number[] = [];
     for (let i = 0; i < d.length; i += 4) {
-      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      const bin  = gray > 128 ? 255 : 0;   // hard binary threshold
-      d[i] = d[i + 1] = d[i + 2] = bin;
+      grays.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+    }
+    const lo = Math.min(...grays);
+    const hi = Math.max(...grays);
+    const range = hi - lo || 1;
+    for (let i = 0, gi = 0; i < d.length; i += 4, gi++) {
+      const stretched = Math.round(((grays[gi] - lo) / range) * 255);
+      d[i] = d[i + 1] = d[i + 2] = stretched;
     }
     ctx.putImageData(img, 0, 0);
 
+    // Also prepare inverted version (for dark plates with light chars)
+    const outInv = document.createElement('canvas');
+    outInv.width = out.width; outInv.height = out.height;
+    const ctxInv = outInv.getContext('2d')!;
+    ctxInv.filter = 'invert(1)';
+    ctxInv.drawImage(out, 0, 0);
+
     const worker = await createWorker('eng');
     try {
-      // Restrict Tesseract to plate chars only — kills background word noise
       await worker.setParameters({
         tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-        tessedit_pageseg_mode: '7' as any, // treat as single text line
+        tessedit_pageseg_mode: '11' as any, // sparse text — most forgiving
       });
-      const { data: { text } } = await worker.recognize(out);
-      return text.trim();
+      const [r1, r2] = await Promise.all([
+        worker.recognize(out),
+        worker.recognize(outInv),
+      ]);
+      return [r1.data.text.trim(), r2.data.text.trim()];
     } finally {
       await worker.terminate();
     }
   };
 
-  // Try multiple horizontal/vertical crop bands and return the best plate hit
+  // Try crop bands from bottom of frame upward; return all plate-like strings
   const ocrFrame = async (source: HTMLCanvasElement | HTMLVideoElement, w: number, h: number): Promise<string[]> => {
-    // Indian plates appear roughly in the lower 45% of a front-facing shot
-    // We try three bands: full bottom strip, tighter bottom-centre, and full frame
     const bands = [
-      { sx: 0,          sy: Math.floor(h * 0.55), sw: w,                sh: Math.floor(h * 0.45) }, // bottom 45%
-      { sx: Math.floor(w * 0.1), sy: Math.floor(h * 0.6),  sw: Math.floor(w * 0.8), sh: Math.floor(h * 0.35) }, // centre-bottom
-      { sx: 0,          sy: Math.floor(h * 0.70), sw: w,                sh: Math.floor(h * 0.30) }, // bottom 30%
-      { sx: 0,          sy: 0,                    sw: w,                sh: h                    }, // full frame fallback
+      { sx: 0,                   sy: Math.floor(h * 0.55), sw: w,                    sh: Math.floor(h * 0.45) },
+      { sx: Math.floor(w * 0.1), sy: Math.floor(h * 0.60), sw: Math.floor(w * 0.8),  sh: Math.floor(h * 0.35) },
+      { sx: 0,                   sy: Math.floor(h * 0.70), sw: w,                    sh: Math.floor(h * 0.30) },
+      { sx: 0,                   sy: 0,                     sw: w,                    sh: h                    },
     ];
 
-    // Indian plate pattern — also match common OCR confusions:
-    //   K↔A, O↔0, Q↔0, I↔1, B↔8
-    const PLATE_RE = /[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}/;
+    // Loose pattern — catches OCR noise like AQ2MN1826 for KA02MN1826
+    const PLATE_RE = /[A-Z0-9]{2}\d{1,2}[A-Z0-9]{1,3}\d{3,4}/;
 
     const hits: string[] = [];
     for (const { sx, sy, sw, sh } of bands) {
       if (sw <= 0 || sh <= 0) continue;
-      const raw = await ocrRegion(source, sx, sy, sw, sh);
-      const cleaned = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
-      if (PLATE_RE.test(cleaned)) {
-        hits.push(cleaned);
-        break; // found a good match — no need to try more bands
+      const texts = await ocrRegion(source, sx, sy, sw, sh);
+      for (const raw of texts) {
+        const cleaned = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        if (cleaned.length < 5) continue;
+        if (PLATE_RE.test(cleaned)) {
+          hits.push(cleaned);
+        } else {
+          hits.push(cleaned.slice(0, 12));
+        }
       }
-      if (cleaned.length >= 6) hits.push(cleaned); // keep partial for fusion
+      // If we already have a plate-regex hit, stop trying more bands
+      if (hits.some(h => PLATE_RE.test(h))) break;
     }
     return hits.length > 0 ? hits : ['UNREADABLE'];
   };
