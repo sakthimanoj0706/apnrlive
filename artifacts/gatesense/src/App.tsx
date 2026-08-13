@@ -1,4 +1,5 @@
 import React, { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { createWorker } from 'tesseract.js';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import { Link, Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import { Activity, AlertOctagon, AlertTriangle, ArrowDownToLine, ArrowLeftRight, ArrowUpRight, BarChart3, Bell, Camera, CheckCircle2, ChevronDown, CircleDot, Clock3, Cpu, Database, FileBarChart, FileSearch, Gauge, LogOut, Menu, Pencil, Plus, Radio, RefreshCw, Search, Settings, ShieldCheck, Siren, SlidersHorizontal, Truck, UserRound, Users, XCircle } from 'lucide-react';
@@ -162,28 +163,86 @@ function DetectPage() {
     setNotice(`Loaded video file: ${file.name}. Ready for ANPR extraction.`);
   };
 
-  const extractPlatesFromVideo = () => {
-    if (!videoUrl) return;
-    setProcessingVideo(true);
-    setNotice('Sampling video frames & extracting plate numbers via ANPR...');
+  // Run Tesseract OCR on a canvas element and return the cleaned text
+  const ocrCanvas = async (canvas: HTMLCanvasElement): Promise<string> => {
+    const worker = await createWorker('eng');
+    try {
+      // Preprocess: convert to grayscale + boost contrast to help plate OCR
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+        for (let i = 0; i < data.length; i += 4) {
+          // Grayscale
+          const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          // Stretch contrast: clamp to [40,220] range then scale to [0,255]
+          const stretched = Math.max(0, Math.min(255, ((gray - 40) / 180) * 255));
+          data[i] = data[i + 1] = data[i + 2] = stretched;
+        }
+        ctx.putImageData(imageData, 0, 0);
+      }
+      const { data: { text } } = await worker.recognize(canvas);
+      return text;
+    } finally {
+      await worker.terminate();
+    }
+  };
 
-    setTimeout(() => {
-      let sampledFrames = ['KA02MM9091', 'KA02MM9091', 'KA02MM9091'];
-      if (videoFileName && videoFileName.toUpperCase().includes('KA')) {
-        sampledFrames = ['KA02MM9091', 'KA02MM9091', 'KA02MM9091'];
-      } else {
-        const samplePlates = ['KA02MM9091', 'TN37AB1234', 'KA05MZ5678', 'MH12QX9031', 'GJ18BR2290', 'WB12AB1234'];
-        const primaryPlate = samplePlates[Math.floor(Math.random() * samplePlates.length)];
-        sampledFrames = [primaryPlate, primaryPlate, primaryPlate.replace('B', '8').replace('0', 'O')];
+  // Extract real OCR text from multiple video frames by seeking the video element
+  const extractPlatesFromVideo = async () => {
+    if (!videoUrl || !recordedVideoRef.current) return;
+    setProcessingVideo(true);
+    setNotice('Sampling video frames & running real OCR via Tesseract.js...');
+
+    try {
+      const video = recordedVideoRef.current;
+      // Wait for video metadata so we know the duration
+      await new Promise<void>((resolve) => {
+        if (video.readyState >= 1) { resolve(); return; }
+        video.addEventListener('loadedmetadata', () => resolve(), { once: true });
+      });
+
+      const duration = video.duration || 10;
+      const numFrames = Math.min(5, Math.max(1, Math.floor(duration)));
+      const timestamps = Array.from({ length: numFrames }, (_, i) =>
+        (i / Math.max(numFrames - 1, 1)) * (duration - 0.5)
+      );
+
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+      const ctx = canvas.getContext('2d')!;
+
+      const ocrResults: string[] = [];
+      const PLATE_RE = /[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}/g;
+
+      for (const ts of timestamps) {
+        // Seek to timestamp and wait for seeked event
+        await new Promise<void>((resolve) => {
+          video.currentTime = ts;
+          video.addEventListener('seeked', () => resolve(), { once: true });
+        });
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const rawText = await ocrCanvas(canvas);
+        const cleaned = rawText.toUpperCase().replace(/[^A-Z0-9 ]/g, ' ');
+        const matches = [...cleaned.matchAll(PLATE_RE)].map(m => m[0].replace(/\s+/g, ''));
+        if (matches.length > 0) {
+          ocrResults.push(...matches);
+        } else if (cleaned.trim().length >= 4) {
+          // No plate regex match — still send the raw OCR text so fusion can try
+          ocrResults.push(cleaned.trim().replace(/\s+/g, '').slice(0, 12));
+        }
+        setNotice(`Scanning frame at ${ts.toFixed(1)}s — found: ${ocrResults.join(', ') || 'no plate yet'}`);
       }
 
-      setFrames(sampledFrames);
+      const finalFrames = ocrResults.length > 0 ? ocrResults.slice(0, 5) : ['UNREADABLE'];
+      setFrames(finalFrames);
 
-      create.mutate({ data: { frames: sampledFrames, gate } }, {
+      create.mutate({ data: { frames: finalFrames, gate } }, {
         onSuccess: (res) => {
           setResult(res);
           setProcessingVideo(false);
-          setNotice(`Extracted plate number ${res.finalPlate} from video ${videoFileName}!`);
+          setNotice(`Real OCR complete — plate ${res.finalPlate} extracted from ${videoFileName}`);
           qc.invalidateQueries({ queryKey: getGetAlertsQueryKey() });
           qc.invalidateQueries({ queryKey: getGetEventsQueryKey() });
           qc.invalidateQueries({ queryKey: getGetDashboardSummaryQueryKey() });
@@ -192,40 +251,54 @@ function DetectPage() {
         },
         onError: () => {
           setProcessingVideo(false);
-          setNotice('Failed to extract plate from video.');
+          setNotice('Fusion failed after real OCR extraction.');
         }
       });
-    }, 1200);
+    } catch (err) {
+      setProcessingVideo(false);
+      setNotice(`OCR error: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
-  const captureFrame = () => {
+  // Capture current webcam frame and run real Tesseract OCR on actual pixels
+  const captureFrame = async () => {
     if (!videoRef.current) return;
     setCapturing(true);
-    const canvas = document.createElement('canvas');
-    canvas.width = videoRef.current.videoWidth || 640;
-    canvas.height = videoRef.current.videoHeight || 480;
-    const ctx = canvas.getContext('2d');
-    if (ctx) {
-      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
-    }
-    const samplePlates = ['TN37AB1234', 'KA05MZ5678', 'MH12QX9031', 'GJ18BR2290', 'WB12AB1234'];
-    const detectedPlate = samplePlates[Math.floor(Math.random() * samplePlates.length)];
-    const noisyPlate = detectedPlate.replace('B', '8').replace('0', 'O');
-    
-    const newFrames = [detectedPlate, detectedPlate, noisyPlate];
-    setFrames(newFrames);
-    
-    create.mutate({ data: { frames: newFrames, gate } }, {
-      onSuccess: (res) => {
-        setResult(res);
-        setCapturing(false);
-        setNotice(`Webcam frame captured! Detected plate ${res.finalPlate} at ${gate}.`);
-      },
-      onError: () => {
-        setCapturing(false);
-        setNotice('Detection failed on camera capture.');
+    setNotice('Running real OCR on webcam frame...');
+
+    try {
+      const video = videoRef.current;
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       }
-    });
+
+      const rawText = await ocrCanvas(canvas);
+      const cleaned = rawText.toUpperCase().replace(/[^A-Z0-9 ]/g, ' ');
+      const PLATE_RE = /[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}/g;
+      const matches = [...cleaned.matchAll(PLATE_RE)].map(m => m[0].replace(/\s+/g, ''));
+      const ocrText = matches.length > 0 ? matches[0] : cleaned.trim().replace(/\s+/g, '').slice(0, 12) || 'UNREADABLE';
+      const newFrames = [ocrText, ocrText, ocrText];
+      setFrames(newFrames);
+
+      create.mutate({ data: { frames: newFrames, gate } }, {
+        onSuccess: (res) => {
+          setResult(res);
+          setCapturing(false);
+          setNotice(`Webcam OCR complete — plate ${res.finalPlate} at ${gate}.`);
+        },
+        onError: () => {
+          setCapturing(false);
+          setNotice('Fusion failed after webcam OCR.');
+        }
+      });
+    } catch (err) {
+      setCapturing(false);
+      setNotice(`Webcam OCR error: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   useEffect(() => {
