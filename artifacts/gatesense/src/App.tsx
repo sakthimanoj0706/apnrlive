@@ -163,32 +163,78 @@ function DetectPage() {
     setNotice(`Loaded video file: ${file.name}. Ready for ANPR extraction.`);
   };
 
-  // Run Tesseract OCR on a canvas element and return the cleaned text
-  const ocrCanvas = async (canvas: HTMLCanvasElement): Promise<string> => {
+  // ── OCR helper ────────────────────────────────────────────────────────────
+  //  1. Crop to candidate plate region (passed as sx,sy,sw,sh in source coords)
+  //  2. Scale up 3× so characters are bigger
+  //  3. Binary-threshold: every pixel above mid-grey → white, else → black
+  //  4. Run Tesseract with alphanumeric-only whitelist
+  const ocrRegion = async (
+    source: HTMLCanvasElement | HTMLVideoElement,
+    sx: number, sy: number, sw: number, sh: number
+  ): Promise<string> => {
+    const SCALE = 3;
+    const out = document.createElement('canvas');
+    out.width  = sw * SCALE;
+    out.height = sh * SCALE;
+    const ctx = out.getContext('2d')!;
+
+    // Draw scaled crop
+    ctx.drawImage(source, sx, sy, sw, sh, 0, 0, out.width, out.height);
+
+    // Binary threshold (grayscale → black or white)
+    const img = ctx.getImageData(0, 0, out.width, out.height);
+    const d   = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const bin  = gray > 128 ? 255 : 0;   // hard binary threshold
+      d[i] = d[i + 1] = d[i + 2] = bin;
+    }
+    ctx.putImageData(img, 0, 0);
+
     const worker = await createWorker('eng');
     try {
-      // Preprocess: convert to grayscale + boost contrast to help plate OCR
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const data = imageData.data;
-        for (let i = 0; i < data.length; i += 4) {
-          // Grayscale
-          const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-          // Stretch contrast: clamp to [40,220] range then scale to [0,255]
-          const stretched = Math.max(0, Math.min(255, ((gray - 40) / 180) * 255));
-          data[i] = data[i + 1] = data[i + 2] = stretched;
-        }
-        ctx.putImageData(imageData, 0, 0);
-      }
-      const { data: { text } } = await worker.recognize(canvas);
-      return text;
+      // Restrict Tesseract to plate chars only — kills background word noise
+      await worker.setParameters({
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+        tessedit_pageseg_mode: '7' as any, // treat as single text line
+      });
+      const { data: { text } } = await worker.recognize(out);
+      return text.trim();
     } finally {
       await worker.terminate();
     }
   };
 
-  // Extract real OCR text from multiple video frames by seeking the video element
+  // Try multiple horizontal/vertical crop bands and return the best plate hit
+  const ocrFrame = async (source: HTMLCanvasElement | HTMLVideoElement, w: number, h: number): Promise<string[]> => {
+    // Indian plates appear roughly in the lower 45% of a front-facing shot
+    // We try three bands: full bottom strip, tighter bottom-centre, and full frame
+    const bands = [
+      { sx: 0,          sy: Math.floor(h * 0.55), sw: w,                sh: Math.floor(h * 0.45) }, // bottom 45%
+      { sx: Math.floor(w * 0.1), sy: Math.floor(h * 0.6),  sw: Math.floor(w * 0.8), sh: Math.floor(h * 0.35) }, // centre-bottom
+      { sx: 0,          sy: Math.floor(h * 0.70), sw: w,                sh: Math.floor(h * 0.30) }, // bottom 30%
+      { sx: 0,          sy: 0,                    sw: w,                sh: h                    }, // full frame fallback
+    ];
+
+    // Indian plate pattern — also match common OCR confusions:
+    //   K↔A, O↔0, Q↔0, I↔1, B↔8
+    const PLATE_RE = /[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}/;
+
+    const hits: string[] = [];
+    for (const { sx, sy, sw, sh } of bands) {
+      if (sw <= 0 || sh <= 0) continue;
+      const raw = await ocrRegion(source, sx, sy, sw, sh);
+      const cleaned = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (PLATE_RE.test(cleaned)) {
+        hits.push(cleaned);
+        break; // found a good match — no need to try more bands
+      }
+      if (cleaned.length >= 6) hits.push(cleaned); // keep partial for fusion
+    }
+    return hits.length > 0 ? hits : ['UNREADABLE'];
+  };
+
+  // ── Extract plates from uploaded video ────────────────────────────────────
   const extractPlatesFromVideo = async () => {
     if (!videoUrl || !recordedVideoRef.current) return;
     setProcessingVideo(true);
@@ -196,53 +242,44 @@ function DetectPage() {
 
     try {
       const video = recordedVideoRef.current;
-      // Wait for video metadata so we know the duration
       await new Promise<void>((resolve) => {
         if (video.readyState >= 1) { resolve(); return; }
         video.addEventListener('loadedmetadata', () => resolve(), { once: true });
       });
 
       const duration = video.duration || 10;
+      const w = video.videoWidth  || 640;
+      const h = video.videoHeight || 480;
       const numFrames = Math.min(5, Math.max(1, Math.floor(duration)));
       const timestamps = Array.from({ length: numFrames }, (_, i) =>
         (i / Math.max(numFrames - 1, 1)) * (duration - 0.5)
       );
 
-      const canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth || 640;
-      canvas.height = video.videoHeight || 480;
-      const ctx = canvas.getContext('2d')!;
-
-      const ocrResults: string[] = [];
-      const PLATE_RE = /[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}/g;
+      const allResults: string[] = [];
 
       for (const ts of timestamps) {
-        // Seek to timestamp and wait for seeked event
         await new Promise<void>((resolve) => {
           video.currentTime = ts;
           video.addEventListener('seeked', () => resolve(), { once: true });
         });
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const rawText = await ocrCanvas(canvas);
-        const cleaned = rawText.toUpperCase().replace(/[^A-Z0-9 ]/g, ' ');
-        const matches = [...cleaned.matchAll(PLATE_RE)].map(m => m[0].replace(/\s+/g, ''));
-        if (matches.length > 0) {
-          ocrResults.push(...matches);
-        } else if (cleaned.trim().length >= 4) {
-          // No plate regex match — still send the raw OCR text so fusion can try
-          ocrResults.push(cleaned.trim().replace(/\s+/g, '').slice(0, 12));
-        }
-        setNotice(`Scanning frame at ${ts.toFixed(1)}s — found: ${ocrResults.join(', ') || 'no plate yet'}`);
+        const frameHits = await ocrFrame(video, w, h);
+        allResults.push(...frameHits);
+        setNotice(`Frame ${ts.toFixed(1)}s → ${frameHits.join(', ')}`);
       }
 
-      const finalFrames = ocrResults.length > 0 ? ocrResults.slice(0, 5) : ['UNREADABLE'];
+      // De-duplicate and prefer results that look like a plate
+      const PLATE_RE = /[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}/;
+      const sorted = [...new Set(allResults)].sort((a, b) =>
+        (PLATE_RE.test(b) ? 1 : 0) - (PLATE_RE.test(a) ? 1 : 0)
+      );
+      const finalFrames = sorted.slice(0, 5);
       setFrames(finalFrames);
 
       create.mutate({ data: { frames: finalFrames, gate } }, {
         onSuccess: (res) => {
           setResult(res);
           setProcessingVideo(false);
-          setNotice(`Real OCR complete — plate ${res.finalPlate} extracted from ${videoFileName}`);
+          setNotice(`OCR complete — plate ${res.finalPlate} extracted from ${videoFileName}`);
           qc.invalidateQueries({ queryKey: getGetAlertsQueryKey() });
           qc.invalidateQueries({ queryKey: getGetEventsQueryKey() });
           qc.invalidateQueries({ queryKey: getGetDashboardSummaryQueryKey() });
@@ -260,7 +297,7 @@ function DetectPage() {
     }
   };
 
-  // Capture current webcam frame and run real Tesseract OCR on actual pixels
+  // ── Webcam capture ────────────────────────────────────────────────────────
   const captureFrame = async () => {
     if (!videoRef.current) return;
     setCapturing(true);
@@ -268,20 +305,10 @@ function DetectPage() {
 
     try {
       const video = videoRef.current;
-      const canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth || 640;
-      canvas.height = video.videoHeight || 480;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      }
-
-      const rawText = await ocrCanvas(canvas);
-      const cleaned = rawText.toUpperCase().replace(/[^A-Z0-9 ]/g, ' ');
-      const PLATE_RE = /[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}/g;
-      const matches = [...cleaned.matchAll(PLATE_RE)].map(m => m[0].replace(/\s+/g, ''));
-      const ocrText = matches.length > 0 ? matches[0] : cleaned.trim().replace(/\s+/g, '').slice(0, 12) || 'UNREADABLE';
-      const newFrames = [ocrText, ocrText, ocrText];
+      const w = video.videoWidth  || 640;
+      const h = video.videoHeight || 480;
+      const frameHits = await ocrFrame(video, w, h);
+      const newFrames = frameHits.length > 0 ? frameHits : ['UNREADABLE'];
       setFrames(newFrames);
 
       create.mutate({ data: { frames: newFrames, gate } }, {

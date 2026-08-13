@@ -292,8 +292,18 @@ router.post("/detections", (req, res) => {
     return { index: index + 1, rawText, confidence: Number((0.68 + (index * 0.05) + Math.random() * 0.12).toFixed(2)) };
   });
   const rawPlate = reads[0]?.rawText ?? seedPlates[0];
-  const knownPlate = seedPlates.find((plate) => rawPlate.replace(/0/g, "O").replace(/1/g, "I").replace(/8/g, "B") === plate.replace(/0/g, "O").replace(/1/g, "I").replace(/8/g, "B"));
-  const finalPlate = knownPlate ?? rawPlate.replace(/O/g, "0").replace(/I/g, "1");
+  // Normalise common OCR confusions before matching:
+  //   O↔0, I↔1, B↔8, Q→0, S→5 (less common but seen)
+  const normalise = (s: string) => s
+    .replace(/O/g, "0")
+    .replace(/I/g, "1")
+    .replace(/B/g, "8")
+    .replace(/Q/g, "0")
+    .replace(/S/g, "5");
+  const knownPlate = seedPlates.find(
+    (plate) => normalise(rawPlate) === normalise(plate)
+  );
+  const finalPlate = knownPlate ?? rawPlate.replace(/O/g, "0").replace(/Q/g, "0").replace(/I/g, "1");
   res.status(201).json({ id: ++nextId, finalPlate, rawPlate, confidence: Number((reads.reduce((sum, read) => sum + read.confidence, 0) / reads.length).toFixed(2)), isCorrected: finalPlate !== rawPlate, frames: reads, decision: decisionFor(finalPlate) });
 });
 
