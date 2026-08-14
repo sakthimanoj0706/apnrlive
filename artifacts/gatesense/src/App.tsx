@@ -1,5 +1,5 @@
 import React, { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
-import { createWorker } from 'tesseract.js';
+import { loadDetector, analyzeFrame, fuseFrameResults, type PipelineOutput, type FrameResult } from './lib/anpr-pipeline';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import { Link, Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import { Activity, AlertOctagon, AlertTriangle, ArrowDownToLine, ArrowLeftRight, ArrowUpRight, BarChart3, Bell, Camera, CheckCircle2, ChevronDown, CircleDot, Clock3, Cpu, Database, FileBarChart, FileSearch, Gauge, LogOut, Menu, Pencil, Plus, Radio, RefreshCw, Search, Settings, ShieldCheck, Siren, SlidersHorizontal, Truck, UserRound, Users, XCircle } from 'lucide-react';
@@ -124,10 +124,30 @@ function DetectPage() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [videoFileName, setVideoFileName] = useState('');
   const [processingVideo, setProcessingVideo] = useState(false);
-  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const videoRef       = React.useRef<HTMLVideoElement | null>(null);
   const recordedVideoRef = React.useRef<HTMLVideoElement | null>(null);
-  const streamRef = React.useRef<MediaStream | null>(null);
-  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const streamRef       = React.useRef<MediaStream | null>(null);
+  const fileInputRef    = React.useRef<HTMLInputElement | null>(null);
+  // ANPR pipeline state
+  const detectorRef     = React.useRef<any>(null);
+  const [modelReady, setModelReady] = useState(false);
+  const [debugLog, setDebugLog]     = useState<string[]>([]);
+  const [showDebug, setShowDebug]   = useState(false);
+
+  // Load COCO-SSD detector once on mount
+  useEffect(() => {
+    setNotice('Loading vehicle detector model (first-time download ~6 MB)…');
+    loadDetector()
+      .then(model => {
+        detectorRef.current = model;
+        setModelReady(true);
+        setNotice('Vehicle detector ready.');
+        setTimeout(() => setNotice(''), 2000);
+      })
+      .catch((e: unknown) => {
+        setNotice(`Detector load failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+  }, []);
 
   const startWebcam = async () => {
     try {
@@ -163,97 +183,22 @@ function DetectPage() {
     setNotice(`Loaded video file: ${file.name}. Ready for ANPR extraction.`);
   };
 
-  // ── OCR helper ────────────────────────────────────────────────────────────
-  //  1. Crop + scale up 3× (larger chars = better OCR)
-  //  2. Contrast-stretch to [0,255] (adaptive, works in all lighting)
-  //  3. Tesseract with alphanumeric whitelist + PSM 11 (sparse text)
-  //  4. Try inverted image too (some plates are light-on-dark)
-  const ocrRegion = async (
-    source: HTMLCanvasElement | HTMLVideoElement,
-    sx: number, sy: number, sw: number, sh: number
-  ): Promise<string[]> => {
-    const SCALE = 3;
-    const out = document.createElement('canvas');
-    out.width  = sw * SCALE;
-    out.height = sh * SCALE;
-    const ctx = out.getContext('2d')!;
-    ctx.drawImage(source, sx, sy, sw, sh, 0, 0, out.width, out.height);
-
-    // Adaptive contrast-stretch: find actual min/max luminance in this region
-    const img = ctx.getImageData(0, 0, out.width, out.height);
-    const d = img.data;
-    const grays: number[] = [];
-    for (let i = 0; i < d.length; i += 4) {
-      grays.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
-    }
-    const lo = Math.min(...grays);
-    const hi = Math.max(...grays);
-    const range = hi - lo || 1;
-    for (let i = 0, gi = 0; i < d.length; i += 4, gi++) {
-      const stretched = Math.round(((grays[gi] - lo) / range) * 255);
-      d[i] = d[i + 1] = d[i + 2] = stretched;
-    }
-    ctx.putImageData(img, 0, 0);
-
-    // Also prepare inverted version (for dark plates with light chars)
-    const outInv = document.createElement('canvas');
-    outInv.width = out.width; outInv.height = out.height;
-    const ctxInv = outInv.getContext('2d')!;
-    ctxInv.filter = 'invert(1)';
-    ctxInv.drawImage(out, 0, 0);
-
-    const worker = await createWorker('eng');
-    try {
-      await worker.setParameters({
-        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-        tessedit_pageseg_mode: '11' as any, // sparse text — most forgiving
-      });
-      const [r1, r2] = await Promise.all([
-        worker.recognize(out),
-        worker.recognize(outInv),
-      ]);
-      return [r1.data.text.trim(), r2.data.text.trim()];
-    } finally {
-      await worker.terminate();
-    }
-  };
-
-  // Try crop bands from bottom of frame upward; return all plate-like strings
-  const ocrFrame = async (source: HTMLCanvasElement | HTMLVideoElement, w: number, h: number): Promise<string[]> => {
-    const bands = [
-      { sx: 0,                   sy: Math.floor(h * 0.55), sw: w,                    sh: Math.floor(h * 0.45) },
-      { sx: Math.floor(w * 0.1), sy: Math.floor(h * 0.60), sw: Math.floor(w * 0.8),  sh: Math.floor(h * 0.35) },
-      { sx: 0,                   sy: Math.floor(h * 0.70), sw: w,                    sh: Math.floor(h * 0.30) },
-      { sx: 0,                   sy: 0,                     sw: w,                    sh: h                    },
-    ];
-
-    // Loose pattern — catches OCR noise like AQ2MN1826 for KA02MN1826
-    const PLATE_RE = /[A-Z0-9]{2}\d{1,2}[A-Z0-9]{1,3}\d{3,4}/;
-
-    const hits: string[] = [];
-    for (const { sx, sy, sw, sh } of bands) {
-      if (sw <= 0 || sh <= 0) continue;
-      const texts = await ocrRegion(source, sx, sy, sw, sh);
-      for (const raw of texts) {
-        const cleaned = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
-        if (cleaned.length < 5) continue;
-        if (PLATE_RE.test(cleaned)) {
-          hits.push(cleaned);
-        } else {
-          hits.push(cleaned.slice(0, 12));
-        }
-      }
-      // If we already have a plate-regex hit, stop trying more bands
-      if (hits.some(h => PLATE_RE.test(h))) break;
-    }
-    return hits.length > 0 ? hits : ['UNREADABLE'];
-  };
-
-  // ── Extract plates from uploaded video ────────────────────────────────────
+  // ── Full ANPR pipeline — video ─────────────────────────────────────────────
   const extractPlatesFromVideo = async () => {
     if (!videoUrl || !recordedVideoRef.current) return;
+    if (!detectorRef.current) {
+      setNotice('Vehicle detector still loading — please wait a moment and try again.');
+      return;
+    }
     setProcessingVideo(true);
-    setNotice('Sampling video frames & running real OCR via Tesseract.js...');
+    setDebugLog([]);
+    setNotice('Running ANPR pipeline: vehicle detection → plate localization → OCR…');
+
+    const log: string[] = [];
+    const addLog = (msg: string) => {
+      log.push(msg);
+      setDebugLog([...log]);
+    };
 
     try {
       const video = recordedVideoRef.current;
@@ -262,39 +207,53 @@ function DetectPage() {
         video.addEventListener('loadedmetadata', () => resolve(), { once: true });
       });
 
-      const duration = video.duration || 10;
-      const w = video.videoWidth  || 640;
-      const h = video.videoHeight || 480;
-      const numFrames = Math.min(5, Math.max(1, Math.floor(duration)));
+      const duration   = video.duration || 10;
+      const numFrames  = Math.min(5, Math.max(2, Math.floor(duration / 3)));
+      // Spread timestamps across the video, avoiding the very last 0.5 s
       const timestamps = Array.from({ length: numFrames }, (_, i) =>
-        (i / Math.max(numFrames - 1, 1)) * (duration - 0.5)
+        1.0 + (i / Math.max(numFrames - 1, 1)) * Math.max(duration - 2, 0)
       );
 
-      const allResults: string[] = [];
+      addLog(`Video: ${videoFileName} | duration=${duration.toFixed(1)}s | sampling ${numFrames} frames`);
+
+      const frameResults: FrameResult[] = [];
 
       for (const ts of timestamps) {
         await new Promise<void>((resolve) => {
           video.currentTime = ts;
           video.addEventListener('seeked', () => resolve(), { once: true });
         });
-        const frameHits = await ocrFrame(video, w, h);
-        allResults.push(...frameHits);
-        setNotice(`Frame ${ts.toFixed(1)}s → ${frameHits.join(', ')}`);
+        setNotice(`Analysing frame at ${ts.toFixed(1)}s…`);
+        const fr = await analyzeFrame(detectorRef.current, video, ts, addLog);
+        frameResults.push(fr);
+        addLog(`  → bestText: "${fr.bestText ?? 'none'}" | quality: ${(fr.quality * 100).toFixed(0)}%`);
       }
 
-      // De-duplicate and prefer results that look like a plate
-      const PLATE_RE = /[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}/;
-      const sorted = [...new Set(allResults)].sort((a, b) =>
-        (PLATE_RE.test(b) ? 1 : 0) - (PLATE_RE.test(a) ? 1 : 0)
-      );
-      const finalFrames = sorted.slice(0, 5);
-      setFrames(finalFrames);
+      // Multi-frame fusion
+      const fusion: PipelineOutput = fuseFrameResults(frameResults);
+      fusion.debugLog.forEach(l => addLog(`[FUSION] ${l}`));
 
-      create.mutate({ data: { frames: finalFrames, gate } }, {
+      const certainty = fusion.isPlateCertain ? 'HIGH' : 'LOW';
+      addLog(`[RESULT] plate=${fusion.plate} | confidence=${(fusion.confidence*100).toFixed(0)}% | agreement=${(fusion.frameAgreement*100).toFixed(0)}% | certainty=${certainty}`);
+
+      // Build frame strings for the API (existing fusion endpoint stays unchanged)
+      const apiFrames = frameResults
+        .map(fr => fr.bestText)
+        .filter((t): t is string => t !== null && t.length >= 4)
+        .slice(0, 5);
+
+      if (apiFrames.length === 0) apiFrames.push(fusion.plate);
+      setFrames(apiFrames);
+
+      create.mutate({ data: { frames: apiFrames, gate } }, {
         onSuccess: (res) => {
           setResult(res);
           setProcessingVideo(false);
-          setNotice(`OCR complete — plate ${res.finalPlate} extracted from ${videoFileName}`);
+          setShowDebug(true);
+          const msg = fusion.isPlateCertain
+            ? `✓ Plate detected: ${fusion.plate} (${(fusion.confidence*100).toFixed(0)}% confidence, ${(fusion.frameAgreement*100).toFixed(0)}% frame agreement)`
+            : `⚠ Low confidence result: ${fusion.plate} — manual review recommended`;
+          setNotice(msg);
           qc.invalidateQueries({ queryKey: getGetAlertsQueryKey() });
           qc.invalidateQueries({ queryKey: getGetEventsQueryKey() });
           qc.invalidateQueries({ queryKey: getGetDashboardSummaryQueryKey() });
@@ -303,43 +262,52 @@ function DetectPage() {
         },
         onError: () => {
           setProcessingVideo(false);
-          setNotice('Fusion failed after real OCR extraction.');
+          setNotice('Fusion API call failed.');
         }
       });
     } catch (err) {
       setProcessingVideo(false);
-      setNotice(`OCR error: ${err instanceof Error ? err.message : String(err)}`);
+      setNotice(`Pipeline error: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
-  // ── Webcam capture ────────────────────────────────────────────────────────
+  // ── Full ANPR pipeline — webcam ────────────────────────────────────────────
   const captureFrame = async () => {
     if (!videoRef.current) return;
+    if (!detectorRef.current) {
+      setNotice('Vehicle detector still loading — please wait a moment.');
+      return;
+    }
     setCapturing(true);
-    setNotice('Running real OCR on webcam frame...');
+    setDebugLog([]);
+    setNotice('Running ANPR pipeline on webcam frame…');
+
+    const log: string[] = [];
+    const addLog = (msg: string) => { log.push(msg); setDebugLog([...log]); };
 
     try {
-      const video = videoRef.current;
-      const w = video.videoWidth  || 640;
-      const h = video.videoHeight || 480;
-      const frameHits = await ocrFrame(video, w, h);
-      const newFrames = frameHits.length > 0 ? frameHits : ['UNREADABLE'];
-      setFrames(newFrames);
+      addLog('Webcam frame capture — single frame analysis');
+      const fr = await analyzeFrame(detectorRef.current, videoRef.current, 0, addLog);
+      addLog(`bestText="${fr.bestText ?? 'none'}" quality=${(fr.quality * 100).toFixed(0)}%`);
 
-      create.mutate({ data: { frames: newFrames, gate } }, {
+      const apiFrames = fr.bestText ? [fr.bestText, fr.bestText, fr.bestText] : ['UNREADABLE'];
+      setFrames(apiFrames);
+
+      create.mutate({ data: { frames: apiFrames, gate } }, {
         onSuccess: (res) => {
           setResult(res);
           setCapturing(false);
-          setNotice(`Webcam OCR complete — plate ${res.finalPlate} at ${gate}.`);
+          setShowDebug(true);
+          setNotice(`Webcam detection: ${res.finalPlate} at ${gate}.`);
         },
         onError: () => {
           setCapturing(false);
-          setNotice('Fusion failed after webcam OCR.');
+          setNotice('Fusion API call failed.');
         }
       });
     } catch (err) {
       setCapturing(false);
-      setNotice(`Webcam OCR error: ${err instanceof Error ? err.message : String(err)}`);
+      setNotice(`Pipeline error: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
@@ -427,7 +395,25 @@ function DetectPage() {
             <Button onClick={run} disabled={create.isPending || frames.length === 0} className="w-full" testId="button-run-fusion">{create.isPending ? <Busy label="Fusing reads" /> : <><Cpu className="h-4 w-4" />Run plate fusion</>}</Button>
           </div>
         </div>
-        {notice && <div className="mt-4"><Notice kind={notice.includes('failed') || notice.includes('Unable') ? 'bad' : 'good'}>{notice}</Notice></div>}
+        {notice && <div className="mt-4"><Notice kind={notice.includes('failed') || notice.includes('Unable') || notice.includes('error') || notice.includes('⚠') ? 'bad' : 'good'}>{notice}</Notice></div>}
+        {/* ANPR pipeline status */}
+        <div className="mt-3 flex items-center gap-2 text-[10px] text-muted-foreground">
+          <span className={`inline-block h-2 w-2 rounded-full ${modelReady ? 'bg-accent' : 'bg-yellow-500 animate-pulse'}`} />
+          {modelReady ? 'Vehicle detector ready (COCO-SSD)' : 'Loading vehicle detector…'}
+        </div>
+        {debugLog.length > 0 && (
+          <div className="mt-3">
+            <button onClick={() => setShowDebug(v => !v)} className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground hover:text-foreground transition">
+              <ChevronDown className={`h-3 w-3 transition-transform ${showDebug ? 'rotate-180' : ''}`} />
+              ANPR debug log ({debugLog.length} lines)
+            </button>
+            {showDebug && (
+              <pre className="mt-2 max-h-64 overflow-y-auto rounded border border-border/50 bg-black/40 p-3 text-[9px] leading-5 text-green-400 font-mono whitespace-pre-wrap">
+                {debugLog.join('\n')}
+              </pre>
+            )}
+          </div>
+        )}
       </div>
     </Card>
     <Card className="panel-grid" title="Fusion result">
