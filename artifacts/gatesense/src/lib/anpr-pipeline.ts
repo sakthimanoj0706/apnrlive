@@ -65,10 +65,10 @@ let _detector: any = null;
 
 export async function loadDetector(): Promise<any> {
   if (!_detector) {
-    const [cocoSsdMod] = await Promise.all([
-      import('@tensorflow-models/coco-ssd'),
-      import('@tensorflow/tfjs-backend-webgl'),
-    ]);
+    // Ensure all backends are registered before loading the model
+    await import('@tensorflow/tfjs');
+    
+    const cocoSsdMod = await import('@tensorflow-models/coco-ssd');
     _detector = await cocoSsdMod.load({ base: 'lite_mobilenet_v2' });
   }
   return _detector;
