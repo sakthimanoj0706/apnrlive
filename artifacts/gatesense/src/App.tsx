@@ -1,5 +1,5 @@
 import React, { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
-import { loadDetector, analyzeFrame, fuseFrameResults, type PipelineOutput, type FrameResult } from './lib/anpr-pipeline';
+import { loadDetector, probeFrame, runOcrOnCrop, fuseTrackedFrames, type PipelineOutput, type FrameResult } from './lib/anpr-pipeline';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import { Link, Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import { Activity, AlertOctagon, AlertTriangle, ArrowDownToLine, ArrowLeftRight, ArrowUpRight, BarChart3, Bell, Camera, CheckCircle2, ChevronDown, CircleDot, Clock3, Cpu, Database, FileBarChart, FileSearch, Gauge, LogOut, Menu, Pencil, Plus, Radio, RefreshCw, Search, Settings, ShieldCheck, Siren, SlidersHorizontal, Truck, UserRound, Users, XCircle } from 'lucide-react';
@@ -208,36 +208,51 @@ function DetectPage() {
       });
 
       const duration   = video.duration || 10;
-      const numFrames  = Math.min(5, Math.max(2, Math.floor(duration / 3)));
+      const numProbes  = 12;
       // Spread timestamps across the video, avoiding the very last 0.5 s
-      const timestamps = Array.from({ length: numFrames }, (_, i) =>
-        1.0 + (i / Math.max(numFrames - 1, 1)) * Math.max(duration - 2, 0)
+      const timestamps = Array.from({ length: numProbes }, (_, i) =>
+        1.0 + (i / Math.max(numProbes - 1, 1)) * Math.max(duration - 2, 0)
       );
 
-      addLog(`Video: ${videoFileName} | duration=${duration.toFixed(1)}s | sampling ${numFrames} frames`);
+      addLog(`Video: ${videoFileName} | duration=${duration.toFixed(1)}s | sampling ${numProbes} fast probes`);
 
-      const frameResults: FrameResult[] = [];
+      const probeResults: FrameResult[] = [];
 
       for (const ts of timestamps) {
         await new Promise<void>((resolve) => {
           video.currentTime = ts;
           video.addEventListener('seeked', () => resolve(), { once: true });
         });
-        setNotice(`Analysing frame at ${ts.toFixed(1)}s…`);
-        const fr = await analyzeFrame(detectorRef.current, video, ts, addLog);
-        frameResults.push(fr);
-        addLog(`  → bestText: "${fr.bestText ?? 'none'}" | quality: ${(fr.quality * 100).toFixed(0)}%`);
+        setNotice(`Probing frame at ${ts.toFixed(1)}s…`);
+        const fr = await probeFrame(detectorRef.current, video, ts, addLog);
+        probeResults.push(fr);
+      }
+
+      // Select top 5 frames based on quality for heavy OCR
+      const selectedFrames = probeResults
+        .filter(fr => fr.crop)
+        .sort((a, b) => b.quality - a.quality)
+        .slice(0, 5)
+        .sort((a, b) => a.timestamp - b.timestamp); // keep chronological
+
+      addLog(`Selected top ${selectedFrames.length} frames for heavy OCR.`);
+      setNotice(`Running multi-variant OCR on top ${selectedFrames.length} frames…`);
+
+      const ocrResults: FrameResult[] = [];
+      for (const fr of selectedFrames) {
+        const ocrResult = await runOcrOnCrop(fr, addLog);
+        ocrResults.push(ocrResult);
       }
 
       // Multi-frame fusion
-      const fusion: PipelineOutput = fuseFrameResults(frameResults);
+      const fusion: PipelineOutput = fuseTrackedFrames(ocrResults);
       fusion.debugLog.forEach(l => addLog(`[FUSION] ${l}`));
 
       const certainty = fusion.isPlateCertain ? 'HIGH' : 'LOW';
       addLog(`[RESULT] plate=${fusion.plate} | confidence=${(fusion.confidence*100).toFixed(0)}% | agreement=${(fusion.frameAgreement*100).toFixed(0)}% | certainty=${certainty}`);
 
       // Build frame strings for the API (existing fusion endpoint stays unchanged)
-      const apiFrames = frameResults
+      const apiFrames = ocrResults
         .map(fr => fr.bestText)
         .filter((t): t is string => t !== null && t.length >= 4)
         .slice(0, 5);
@@ -287,10 +302,11 @@ function DetectPage() {
 
     try {
       addLog('Webcam frame capture — single frame analysis');
-      const fr = await analyzeFrame(detectorRef.current, videoRef.current, 0, addLog);
-      addLog(`bestText="${fr.bestText ?? 'none'}" quality=${(fr.quality * 100).toFixed(0)}%`);
+      const fr = await probeFrame(detectorRef.current, videoRef.current, 0, addLog);
+      const ocrFr = await runOcrOnCrop(fr, addLog);
+      addLog(`bestText="${ocrFr.bestText ?? 'none'}" quality=${(ocrFr.quality * 100).toFixed(0)}%`);
 
-      const apiFrames = fr.bestText ? [fr.bestText, fr.bestText, fr.bestText] : ['UNREADABLE'];
+      const apiFrames = ocrFr.bestText ? [ocrFr.bestText, ocrFr.bestText, ocrFr.bestText] : ['UNREADABLE'];
       setFrames(apiFrames);
 
       create.mutate({ data: { frames: apiFrames, gate } }, {

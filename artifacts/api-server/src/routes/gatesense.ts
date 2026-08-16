@@ -284,27 +284,68 @@ router.post("/events/simulate", (_req, res) => {
   res.status(201).json({ event, trip, alert });
 });
 
+function editDistance(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)));
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+  return dp[m][n];
+}
+
 router.post("/detections", (req, res) => {
   const input = CreateDetectionBody.parse(req.body);
   const reads = input.frames.map((frame, index) => {
-    const known = seedPlates[(index + input.frames.length) % seedPlates.length];
-    const rawText = frame.toUpperCase().replace(/[^A-Z0-9]/g, "") || known;
-    return { index: index + 1, rawText, confidence: Number((0.68 + (index * 0.05) + Math.random() * 0.12).toFixed(2)) };
+    // Preserve unverified tokens
+    if (frame === 'UNREADABLE' || frame === 'PLATE NOT VERIFIED') {
+      return { index: index + 1, rawText: frame, confidence: 0 };
+    }
+    const rawText = frame.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    return { index: index + 1, rawText, confidence: Number((0.75 + Math.random() * 0.2).toFixed(2)) };
   });
-  const rawPlate = reads[0]?.rawText ?? seedPlates[0];
-  // Normalise common OCR confusions before matching:
-  //   O↔0, I↔1, B↔8, Q→0, S→5 (less common but seen)
-  const normalise = (s: string) => s
-    .replace(/O/g, "0")
-    .replace(/I/g, "1")
-    .replace(/B/g, "8")
-    .replace(/Q/g, "0")
-    .replace(/S/g, "5");
-  const knownPlate = seedPlates.find(
-    (plate) => normalise(rawPlate) === normalise(plate)
-  );
-  const finalPlate = knownPlate ?? rawPlate.replace(/O/g, "0").replace(/Q/g, "0").replace(/I/g, "1");
-  res.status(201).json({ id: ++nextId, finalPlate, rawPlate, confidence: Number((reads.reduce((sum, read) => sum + read.confidence, 0) / reads.length).toFixed(2)), isCorrected: finalPlate !== rawPlate, frames: reads, decision: decisionFor(finalPlate) });
+  
+  // Use the most frequent read
+  const counts: Record<string, number> = {};
+  for (const r of reads) {
+    if (r.rawText && r.rawText !== 'UNREADABLE' && r.rawText !== 'PLATE NOT VERIFIED') {
+      counts[r.rawText] = (counts[r.rawText] || 0) + 1;
+    }
+  }
+  
+  let rawPlate = '';
+  let maxCount = 0;
+  for (const [text, count] of Object.entries(counts)) {
+    if (count > maxCount) { maxCount = count; rawPlate = text; }
+  }
+  if (!rawPlate) rawPlate = reads[0]?.rawText ?? 'UNREADABLE';
+
+  // Evidence-based correction using database match (Levenshtein distance <= 2)
+  let knownPlate: string | undefined;
+  if (rawPlate !== 'UNREADABLE' && rawPlate !== 'PLATE NOT VERIFIED') {
+    const dbPlates = Array.from(new Set([...vehicles.map(v => v.plate), ...seedPlates]));
+    let bestDist = 3; // Maximum allowed distance for correction is 2
+    for (const p of dbPlates) {
+      const dist = editDistance(rawPlate, p);
+      if (dist < bestDist) {
+        bestDist = dist;
+        knownPlate = p;
+      }
+    }
+  }
+
+  const finalPlate = knownPlate ?? rawPlate;
+  const isCorrected = knownPlate !== undefined && finalPlate !== rawPlate;
+  const confidence = reads.length > 0 ? Number((reads.reduce((sum, read) => sum + read.confidence, 0) / reads.length).toFixed(2)) : 0;
+  
+  res.status(201).json({ 
+    id: ++nextId, 
+    finalPlate, 
+    rawPlate, 
+    confidence, 
+    isCorrected, 
+    frames: reads, 
+    decision: decisionFor(finalPlate) 
+  });
 });
 
 router.get("/trips", (_req, res) => res.json(trips));
